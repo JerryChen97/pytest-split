@@ -74,19 +74,22 @@ where the letters (A to E) refer to individual IPython Notebooks, and the number
 The plugin supports multiple algorithms to split tests into groups.
 Each algorithm makes different tradeoffs, but generally `least_duration` should give more balanced groups.
 
-| Algorithm      | Maintains Absolute Order | Maintains Relative Order | Split Quality | Works with random ordering |
-|----------------|--------------------------|--------------------------|---------------|----------------------------|
-| duration_based_chunks | ✅                | ✅                       | Good          | ❌                         |
-| least_duration | ❌                       | ✅                       | Better        | ✅                         |
+| Algorithm      | Maintains Absolute Order | Maintains Relative Order | Split Quality | Works with random ordering | Scope locality |
+|----------------|--------------------------|--------------------------|---------------|----------------------------|----------------|
+| duration_based_chunks | ✅                | ✅                       | Good          | ❌                         | ✅             |
+| least_duration | ❌                       | ✅                       | Better        | ✅                         | ❌             |
+| least_duration_by_scope | ❌              | ✅                       | Better        | ✅                         | ✅             |
 
 Explanation of the terms in the table:
 
 * Absolute Order: whether each group contains all tests between first and last element in the same order as the original list of tests
 * Relative Order: whether each test in each group has the same relative order to its neighbours in the group as in the original list of tests
 * Works with random ordering: whether the algorithm works with test-shuffling tools such as [`pytest-randomly`](https://github.com/pytest-dev/pytest-randomly)
+* Scope locality: whether tests from the same module (and class) are kept together in the same group, avoiding redundant module imports and fixture setups
 
 The `duration_based_chunks` algorithm aims to find optimal boundaries for the list of tests and every test group contains all tests between the start and end boundary.
 The `least_duration` algorithm walks the list of tests and assigns each test to the group with the smallest current duration.
+The `least_duration_by_scope` algorithm groups tests by scope (module, then class) and uses greedy bin-packing to assign entire scopes to groups. This combines the balancing property of `least_duration` with the locality of `duration_based_chunks`. It is particularly useful with `pytest-xdist --dist=loadscope`, as it avoids redundant module imports across workers. If a single scope exceeds the ideal time per group, it is automatically subdivided (first by class, then by individual test) to maintain balance.
 
 
 [**Demo with GitHub Actions**](https://github.com/jerry-git/pytest-split-gh-actions-demo)

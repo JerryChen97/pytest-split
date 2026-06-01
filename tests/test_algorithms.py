@@ -139,6 +139,205 @@ class TestAlgorithms:
             assert issubclass(Algorithms[a].value.__class__, AlgorithmBase)
 
 
+class TestScopeAwareLeastDuration:
+    """Tests specific to the least_duration_by_scope algorithm."""
+
+    algo = Algorithms["least_duration_by_scope"].value
+
+    def test__keeps_same_module_together(self):
+        """Tests from the same module should land in the same group."""
+        durations = {
+            "mod_a.py::test_1": 1,
+            "mod_a.py::test_2": 1,
+            "mod_b.py::test_1": 1,
+            "mod_b.py::test_2": 1,
+        }
+        items = [item(x) for x in durations]
+        first, second = self.algo(splits=2, items=items, durations=durations)
+
+        # Each module should be entirely in one group
+        first_mods = {i.nodeid.split("::")[0] for i in first.selected}
+        second_mods = {i.nodeid.split("::")[0] for i in second.selected}
+        assert first_mods & second_mods == set()
+
+    def test__balances_by_module_duration(self):
+        """A heavy module should be placed alone to balance groups."""
+        # heavy.py=4, lights=3 each -> total=13, ideal=6.5
+        # heavy.py (4) < 6.5, so no subdivision
+        durations = {
+            "heavy.py::test_1": 2,
+            "heavy.py::test_2": 2,
+            "light_a.py::test_1": 3,
+            "light_b.py::test_1": 3,
+            "light_c.py::test_1": 3,
+        }
+        items = [item(x) for x in durations]
+        first, second = self.algo(splits=2, items=items, durations=durations)
+
+        # heavy.py should be entirely in one group
+        first_mods = {i.nodeid.split("::")[0] for i in first.selected}
+        second_mods = {i.nodeid.split("::")[0] for i in second.selected}
+        assert first_mods & second_mods == set()
+
+        # heavy.py (4s) + light_c (3s) = 7s vs light_a (3s) + light_b (3s) = 6s
+        # (greedy packing will group them based on descending duration)
+
+    def test__subdivides_oversized_module_by_class(self):
+        """When a module exceeds ideal_per_group, split by class."""
+        durations = {
+            "big.py::ClassA::test_1": 3,
+            "big.py::ClassA::test_2": 3,
+            "big.py::ClassB::test_1": 3,
+            "big.py::ClassB::test_2": 3,
+            "small.py::test_1": 1,
+        }
+        # Total=13, 2 splits, ideal=6.5. big.py=12 > 6.5 -> subdivide.
+        # ClassA=6, ClassB=6, both <= 6.5 -> class-level packing.
+        items = [item(x) for x in durations]
+        first, second = self.algo(splits=2, items=items, durations=durations)
+
+        # ClassA and ClassB should be in different groups
+        first_classes = {
+            i.nodeid.split("::")[1]
+            for i in first.selected
+            if i.nodeid.startswith("big.py")
+        }
+        second_classes = {
+            i.nodeid.split("::")[1]
+            for i in second.selected
+            if i.nodeid.startswith("big.py")
+        }
+        # They should not both contain both classes
+        assert not (first_classes == {"ClassA", "ClassB"})
+
+    def test__subdivides_oversized_class_to_individual_tests(self):
+        """When a class also exceeds ideal_per_group, fall back to per-test."""
+        durations = {
+            "big.py::test_a": 4,
+            "big.py::test_b": 4,
+            "big.py::test_c": 4,
+            "small.py::test_x": 1,
+        }
+        # Total=13, 2 splits, ideal=6.5. big.py=12 > 6.5 -> subdivide by class.
+        # All are bare functions -> <no-class>=12 > 6.5 -> individual packing.
+        items = [item(x) for x in durations]
+        first, second = self.algo(splits=2, items=items, durations=durations)
+
+        first_ids = {i.nodeid for i in first.selected}
+        second_ids = {i.nodeid for i in second.selected}
+
+        # All tests should be assigned
+        assert first_ids | second_ids == set(durations.keys())
+        # big.py tests should be split across groups (not all in one)
+        big_in_first = {n for n in first_ids if n.startswith("big.py")}
+        big_in_second = {n for n in second_ids if n.startswith("big.py")}
+        assert big_in_first and big_in_second
+
+    def test__preserves_order_within_group(self):
+        """Original order of tests should be preserved within each group."""
+        # mod_a=3, mod_b=5 -> total=8, ideal=4. Both <= 4, so no subdivision.
+        durations = {
+            "mod_a.py::test_3": 1,
+            "mod_a.py::test_1": 1,
+            "mod_a.py::test_2": 1,
+            "mod_b.py::test_x": 2,
+            "mod_b.py::test_y": 3,
+        }
+        items = [item(x) for x in durations]
+        first, second = self.algo(splits=2, items=items, durations=durations)
+
+        # Find the group containing mod_a
+        mod_a_group = (
+            first
+            if any("mod_a.py" in i.nodeid for i in first.selected)
+            else second
+        )
+        mod_a_ids = [i.nodeid for i in mod_a_group.selected if "mod_a.py" in i.nodeid]
+        # Should be in original order (test_3, test_1, test_2)
+        assert mod_a_ids == [
+            "mod_a.py::test_3",
+            "mod_a.py::test_1",
+            "mod_a.py::test_2",
+        ]
+
+    def test__deselected_contains_other_groups_items(self):
+        """Each group's deselected list should contain all other groups' tests."""
+        durations = {
+            "mod_a.py::test_1": 1,
+            "mod_b.py::test_1": 1,
+            "mod_c.py::test_1": 1,
+        }
+        items = [item(x) for x in durations]
+        groups = self.algo(splits=3, items=items, durations=durations)
+
+        for i, group in enumerate(groups):
+            # All items not in selected should be in deselected
+            selected_set = set(group.selected)
+            deselected_set = set(group.deselected)
+            all_items_set = set(items)
+            assert selected_set | deselected_set == all_items_set
+            assert selected_set & deselected_set == set()
+
+    def test__duration_is_correct(self):
+        """Group duration should match sum of contained test durations."""
+        durations = {
+            "mod_a.py::test_1": 2.5,
+            "mod_a.py::test_2": 3.5,
+            "mod_b.py::test_1": 4.0,
+        }
+        items = [item(x) for x in durations]
+        groups = self.algo(splits=2, items=items, durations=durations)
+
+        for group in groups:
+            expected_dur = sum(durations[i.nodeid] for i in group.selected)
+            assert group.duration == pytest.approx(expected_dur)
+
+    def test__many_small_modules_balance(self):
+        """Many small equal modules should distribute evenly."""
+        durations = {}
+        for i in range(12):
+            durations[f"mod_{i}.py::test_1"] = 1.0
+        items = [item(x) for x in durations]
+        groups = self.algo(splits=3, items=items, durations=durations)
+
+        # Each group should have 4 tests (12 / 3)
+        for group in groups:
+            assert len(group.selected) == 4
+
+    def test__single_split_returns_all(self):
+        """With splits=1, all tests should be in one group."""
+        durations = {
+            "mod_a.py::test_1": 1,
+            "mod_b.py::test_1": 2,
+        }
+        items = [item(x) for x in durations]
+        (group,) = self.algo(splits=1, items=items, durations=durations)
+
+        assert len(group.selected) == 2
+        assert group.deselected == []
+        assert group.duration == pytest.approx(3.0)
+
+    def test__deterministic_across_item_orderings(self):
+        """Same grouping regardless of input item order."""
+        durations = {
+            "mod_a.py::test_1": 1,
+            "mod_a.py::test_2": 2,
+            "mod_b.py::test_1": 3,
+            "mod_b.py::test_2": 4,
+            "mod_c.py::test_1": 5,
+        }
+        items_list = [item(x) for x in durations]
+
+        reference = None
+        for perm in itertools.permutations(items_list):
+            groups = self.algo(splits=2, items=list(perm), durations=durations)
+            group_sets = tuple(frozenset(i.nodeid for i in g.selected) for g in groups)
+            if reference is None:
+                reference = group_sets
+            else:
+                assert group_sets == reference
+
+
 class MyAlgorithm(AlgorithmBase):
     def __call__(self, a, b, c):
         """no-op"""
