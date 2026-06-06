@@ -201,14 +201,13 @@ def _is_notebook_scope(scope: str) -> bool:
     return scope.split("::", 1)[0].endswith(".ipynb")
 
 
-def _refine_module_scope(
+def _scope_units_for_module(
     module: str,
     mod_tests: "list[tuple[nodes.Item, float, int]]",
     ideal_per_group: float,
-    scope_items: "dict[str, list[tuple[nodes.Item, float, int]]]",
-) -> None:
+) -> "dict[str, list[tuple[nodes.Item, float, int]]]":
     """
-    Add the scope units for a single module into ``scope_items``.
+    Return the scope units (``scope_key -> tests``) for a single module.
 
     Implements the locality hierarchy:
 
@@ -216,25 +215,30 @@ def _refine_module_scope(
       is kept whole as a single scope unit;
     * an oversized non-notebook module is refined into ``loadscope`` units;
     * a ``loadscope`` unit that is still oversized falls back to individual tests.
+
+    All returned keys are prefixed by ``module`` (the file path), so units from
+    different modules never collide.
     """
     mod_dur = sum(dur for _, dur, _ in mod_tests)
     if mod_dur <= ideal_per_group or _is_notebook_scope(module):
-        scope_items[module] = mod_tests
-        return
+        return {module: mod_tests}
 
     loadscope_units: dict[str, list[tuple[nodes.Item, float, int]]] = {}
     for item, dur, orig_idx in mod_tests:
         loadscope_units.setdefault(_loadscope_scope(item.nodeid), []).append(
             (item, dur, orig_idx)
         )
+
+    scope_units: dict[str, list[tuple[nodes.Item, float, int]]] = {}
     for scope, unit_tests in loadscope_units.items():
         unit_dur = sum(dur for _, dur, _ in unit_tests)
         if unit_dur <= ideal_per_group:
-            scope_items[scope] = unit_tests
+            scope_units[scope] = unit_tests
         else:
             # Fall back to individual-test packing for this unit.
             for item, dur, orig_idx in unit_tests:
-                scope_items[item.nodeid] = [(item, dur, orig_idx)]
+                scope_units[item.nodeid] = [(item, dur, orig_idx)]
+    return scope_units
 
 
 class ScopeAwareLeastDurationAlgorithm(AlgorithmBase):
@@ -299,7 +303,9 @@ class ScopeAwareLeastDurationAlgorithm(AlgorithmBase):
         # scope_key -> list of (item, dur, orig_idx)
         scope_items: dict[str, list[tuple[nodes.Item, float, int]]] = {}
         for module, mod_tests in module_items.items():
-            _refine_module_scope(module, mod_tests, ideal_per_group, scope_items)
+            scope_items.update(
+                _scope_units_for_module(module, mod_tests, ideal_per_group)
+            )
 
         # Compute total duration per scope unit
         scope_durations = {

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from pytest_split.algorithms import (
     AlgorithmBase,
     Algorithms,
+    _loadscope_scope,
     _module_scope,
 )
 
@@ -77,6 +78,10 @@ class TestAlgorithms:
         [
             ("duration_based_chunks", [[item("a"), item("b")], [item("c"), item("d")]]),
             ("least_duration", [[item("a"), item("c")], [item("b"), item("d")]]),
+            (
+                "least_duration_by_scope",
+                [[item("a"), item("c")], [item("b"), item("d")]],
+            ),
         ],
     )
     def test__split_tests_calculates_avg_test_duration_only_on_present_tests(
@@ -105,6 +110,10 @@ class TestAlgorithms:
             ),
             (
                 "least_duration",
+                [[item("e")], [item("a"), item("b"), item("c"), item("d")]],
+            ),
+            (
+                "least_duration_by_scope",
                 [[item("e")], [item("a"), item("b"), item("c"), item("d")]],
             ),
         ],
@@ -297,13 +306,13 @@ class TestScopeAwareLeastDuration:
 
     def test__preserves_order_within_group(self):
         """Original order of tests should be preserved within each group."""
-        # mod_a=3, mod_b=5 -> total=8, ideal=4. Both <= 4, so no subdivision.
+        # mod_a=3, mod_b=3 -> total=6, ideal=3. Both <= 3, so no subdivision.
         durations = {
             "mod_a.py::test_3": 1,
             "mod_a.py::test_1": 1,
             "mod_a.py::test_2": 1,
             "mod_b.py::test_x": 2,
-            "mod_b.py::test_y": 3,
+            "mod_b.py::test_y": 1,
         }
         items = [item(x) for x in durations]
         first, second = self.algo(splits=2, items=items, durations=durations)
@@ -396,6 +405,15 @@ class TestScopeAwareLeastDuration:
                 reference = group_sets
             else:
                 assert group_sets == reference
+
+    def test__loadscope_scope_matches_expected_pytest_shapes(self):
+        """_loadscope_scope mirrors xdist's nodeid.rsplit('::', 1)[0] scoping."""
+        assert _loadscope_scope("test_mod.py::test_func") == "test_mod.py"
+        assert (
+            _loadscope_scope("test_mod.py::TestClass::test_method")
+            == "test_mod.py::TestClass"
+        )
+        assert _loadscope_scope("test_mod.py::test_func[param]") == "test_mod.py"
 
 
 class MyAlgorithm(AlgorithmBase):
