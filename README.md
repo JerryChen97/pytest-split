@@ -78,18 +78,25 @@ Each algorithm makes different tradeoffs, but generally `least_duration` should 
 |----------------|--------------------------|--------------------------|---------------|----------------------------|----------------|
 | duration_based_chunks | ✅                | ✅                       | Good          | ❌                         | ✅             |
 | least_duration | ❌                       | ✅                       | Better        | ✅                         | ❌             |
-| least_duration_by_scope | ❌              | ✅                       | Better        | ✅                         | ✅             |
+| least_duration_by_scope | ❌              | ✅                       | Better        | ✅                         | Best-effort    |
 
 Explanation of the terms in the table:
 
 * Absolute Order: whether each group contains all tests between first and last element in the same order as the original list of tests
 * Relative Order: whether each test in each group has the same relative order to its neighbours in the group as in the original list of tests
 * Works with random ordering: whether the algorithm works with test-shuffling tools such as [`pytest-randomly`](https://github.com/pytest-dev/pytest-randomly)
-* Scope locality: whether tests from the same module (and class) are kept together in the same group, avoiding redundant module imports and fixture setups
+* Scope locality: whether tests from the same module (and, for oversized modules, class) are kept together in the same group, avoiding redundant module imports and fixture setups. `least_duration_by_scope` provides this on a best-effort basis (see below)
 
 The `duration_based_chunks` algorithm aims to find optimal boundaries for the list of tests and every test group contains all tests between the start and end boundary.
 The `least_duration` algorithm walks the list of tests and assigns each test to the group with the smallest current duration.
-The `least_duration_by_scope` algorithm groups tests by scope (module, then class) and uses greedy bin-packing to assign entire scopes to groups. This combines the balancing property of `least_duration` with the locality of `duration_based_chunks`. It is particularly useful with `pytest-xdist --dist=loadscope`, as it avoids redundant module imports across workers. If a single scope exceeds the ideal time per group, it is automatically subdivided (first by class, then by individual test) to maintain balance.
+The `least_duration_by_scope` algorithm groups tests by module scope and uses greedy bin-packing to assign whole modules to groups, combining the balancing property of `least_duration` with module-level locality. It preserves module-level locality **where possible**, refines oversized modules to smaller pytest scopes, and only falls back to individual tests for scopes whose estimated duration alone exceeds the ideal group duration. Concretely:
+
+* a module whose estimated duration is within the ideal per-group duration is kept whole;
+* an oversized module is refined into `loadscope`-like units — `module.py::Class` for test methods and `module.py` for module-level functions (mirroring xdist's `nodeid.rsplit("::", 1)[0]` scoping);
+* a unit that is *still* oversized on its own falls back to individual-test packing;
+* IPython notebook files (`.ipynb`) are always kept atomic, even when oversized, because their cells are order-dependent.
+
+This makes the locality **best-effort** rather than unconditional. The result preserves module-first locality, which pairs well with `pytest-xdist`'s fixture locality and reduces redundant module imports across workers. Note that it is **module-first**, not a drop-in match for xdist `--dist=loadscope` (which prioritizes class grouping over module grouping); it keeps whole modules together until they become oversized.
 
 
 [**Demo with GitHub Actions**](https://github.com/jerry-git/pytest-split-gh-actions-demo)

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from pytest_split.algorithms import (
     AlgorithmBase,
     Algorithms,
+    _module_scope,
 )
 
 item = namedtuple("item", "nodeid")  # noqa: PYI024
@@ -161,9 +162,9 @@ class TestScopeAwareLeastDuration:
         assert first_mods & second_mods == set()
 
     def test__balances_by_module_duration(self):
-        """A heavy module should be placed alone to balance groups."""
+        """Modules are balanced by duration without subdividing any module."""
         # heavy.py=4, lights=3 each -> total=13, ideal=6.5
-        # heavy.py (4) < 6.5, so no subdivision
+        # heavy.py (4) <= 6.5, so no module is subdivided.
         durations = {
             "heavy.py::test_1": 2,
             "heavy.py::test_2": 2,
@@ -174,16 +175,33 @@ class TestScopeAwareLeastDuration:
         items = [item(x) for x in durations]
         first, second = self.algo(splits=2, items=items, durations=durations)
 
-        # heavy.py should be entirely in one group
-        first_mods = {i.nodeid.split("::")[0] for i in first.selected}
-        second_mods = {i.nodeid.split("::")[0] for i in second.selected}
-        assert first_mods & second_mods == set()
+        first_mods = {_module_scope(i.nodeid) for i in first.selected}
+        second_mods = {_module_scope(i.nodeid) for i in second.selected}
 
-        # heavy.py (4s) + light_c (3s) = 7s vs light_a (3s) + light_b (3s) = 6s
-        # (greedy packing will group them based on descending duration)
+        # Every module is assigned wholly to exactly one group (no subdivision).
+        assert first_mods.isdisjoint(second_mods)
+        assert first_mods | second_mods == {
+            "heavy.py",
+            "light_a.py",
+            "light_b.py",
+            "light_c.py",
+        }
+        for module in first_mods | second_mods:
+            module_ids = {n for n in durations if _module_scope(n) == module}
+            owner = first if module in first_mods else second
+            assert module_ids <= {i.nodeid for i in owner.selected}
+
+        # Greedy packing: heavy (4) + light_c (3) = 7 vs light_a (3) + light_b (3) = 6.
+        # (Groups balanced to within a single light module's duration.)
+        assert sorted([first.duration, second.duration]) == [6.0, 7.0]
+        heavy_group = first if "heavy.py" in first_mods else second
+        assert {_module_scope(i.nodeid) for i in heavy_group.selected} == {
+            "heavy.py",
+            "light_c.py",
+        }
 
     def test__subdivides_oversized_module_by_class(self):
-        """When a module exceeds ideal_per_group, split by class."""
+        """An oversized module is refined into whole class-level scopes."""
         durations = {
             "big.py::ClassA::test_1": 3,
             "big.py::ClassA::test_2": 3,
@@ -196,19 +214,39 @@ class TestScopeAwareLeastDuration:
         items = [item(x) for x in durations]
         first, second = self.algo(splits=2, items=items, durations=durations)
 
-        # ClassA and ClassB should be in different groups
-        first_classes = {
-            i.nodeid.split("::")[1]
-            for i in first.selected
-            if i.nodeid.startswith("big.py")
+        def classes_in(group):
+            # loadscope scope of "big.py::Class::test" is "big.py::Class"
+            return {
+                i.nodeid.rsplit("::", 1)[0]
+                for i in group.selected
+                if i.nodeid.startswith("big.py::")
+            }
+
+        first_classes = classes_in(first)
+        second_classes = classes_in(second)
+
+        # big.py is actually refined: each class lands in a different group.
+        assert first_classes
+        assert second_classes
+        assert first_classes.isdisjoint(second_classes)
+        assert first_classes | second_classes == {"big.py::ClassA", "big.py::ClassB"}
+
+        # Each class is assigned wholly to exactly one group: every test of a
+        # class lands together with that class.
+        for group in (first, second):
+            group_ids = {i.nodeid for i in group.selected}
+            for cls in classes_in(group):
+                cls_tests = {n for n in durations if n.startswith(cls + "::")}
+                assert cls_tests <= group_ids
+
+        # small.py is not subdivided and stays whole in one group.
+        small_first = {
+            i.nodeid for i in first.selected if i.nodeid.startswith("small.py")
         }
-        second_classes = {
-            i.nodeid.split("::")[1]
-            for i in second.selected
-            if i.nodeid.startswith("big.py")
+        small_second = {
+            i.nodeid for i in second.selected if i.nodeid.startswith("small.py")
         }
-        # They should not both contain both classes
-        assert not (first_classes == {"ClassA", "ClassB"})
+        assert bool(small_first) != bool(small_second)
 
     def test__subdivides_oversized_class_to_individual_tests(self):
         """When a class also exceeds ideal_per_group, fall back to per-test."""
@@ -233,6 +271,30 @@ class TestScopeAwareLeastDuration:
         big_in_second = {n for n in second_ids if n.startswith("big.py")}
         assert big_in_first and big_in_second
 
+    def test__keeps_notebook_atomic_even_when_oversized(self):
+        """Notebook files must never be refined below file scope, even oversized."""
+        durations = {
+            "nb.ipynb::cell0": 10,
+            "nb.ipynb::cell1": 10,
+            "small.py::test_1": 1,
+        }
+        # Total=21, 2 splits, ideal=10.5. nb.ipynb=20 > 10.5, but as a notebook
+        # it must stay atomic instead of being refined to individual cells.
+        items = [item(x) for x in durations]
+        first, second = self.algo(splits=2, items=items, durations=durations)
+
+        nb_groups = [
+            g
+            for g in (first, second)
+            if any(i.nodeid.startswith("nb.ipynb") for i in g.selected)
+        ]
+        # All notebook cells land together in exactly one group.
+        assert len(nb_groups) == 1
+        nb_ids = {
+            i.nodeid for i in nb_groups[0].selected if i.nodeid.startswith("nb.ipynb")
+        }
+        assert nb_ids == {"nb.ipynb::cell0", "nb.ipynb::cell1"}
+
     def test__preserves_order_within_group(self):
         """Original order of tests should be preserved within each group."""
         # mod_a=3, mod_b=5 -> total=8, ideal=4. Both <= 4, so no subdivision.
@@ -248,9 +310,7 @@ class TestScopeAwareLeastDuration:
 
         # Find the group containing mod_a
         mod_a_group = (
-            first
-            if any("mod_a.py" in i.nodeid for i in first.selected)
-            else second
+            first if any("mod_a.py" in i.nodeid for i in first.selected) else second
         )
         mod_a_ids = [i.nodeid for i in mod_a_group.selected if "mod_a.py" in i.nodeid]
         # Should be in original order (test_3, test_1, test_2)

@@ -177,25 +177,98 @@ def _remove_irrelevant_durations(
     return durations
 
 
+def _module_scope(nodeid: str) -> str:
+    """Return the module/file scope of a nodeid (the part before the first ``::``)."""
+    return nodeid.split("::", 1)[0]
+
+
+def _loadscope_scope(nodeid: str) -> str:
+    """
+    Return the ``pytest-xdist`` ``loadscope``-style scope of a nodeid.
+
+    Mirrors xdist, which scopes by ``nodeid.rsplit("::", 1)[0]``:
+    ``module.py::Class::method`` -> ``module.py::Class`` (class scope) and
+    ``module.py::test_func`` -> ``module.py`` (module scope). Parametrized
+    cases such as ``module.py::test_func[param]`` also reduce to ``module.py``.
+    """
+    if "::" not in nodeid:
+        return nodeid
+    return nodeid.rsplit("::", 1)[0]
+
+
+def _is_notebook_scope(scope: str) -> bool:
+    """Return True if a scope refers to an IPython notebook (``.ipynb``) file."""
+    return scope.split("::", 1)[0].endswith(".ipynb")
+
+
+def _refine_module_scope(
+    module: str,
+    mod_tests: "list[tuple[nodes.Item, float, int]]",
+    ideal_per_group: float,
+    scope_items: "dict[str, list[tuple[nodes.Item, float, int]]]",
+) -> None:
+    """
+    Add the scope units for a single module into ``scope_items``.
+
+    Implements the locality hierarchy:
+
+    * a module within ``ideal_per_group`` (or any notebook, regardless of size)
+      is kept whole as a single scope unit;
+    * an oversized non-notebook module is refined into ``loadscope`` units;
+    * a ``loadscope`` unit that is still oversized falls back to individual tests.
+    """
+    mod_dur = sum(dur for _, dur, _ in mod_tests)
+    if mod_dur <= ideal_per_group or _is_notebook_scope(module):
+        scope_items[module] = mod_tests
+        return
+
+    loadscope_units: dict[str, list[tuple[nodes.Item, float, int]]] = {}
+    for item, dur, orig_idx in mod_tests:
+        loadscope_units.setdefault(_loadscope_scope(item.nodeid), []).append(
+            (item, dur, orig_idx)
+        )
+    for scope, unit_tests in loadscope_units.items():
+        unit_dur = sum(dur for _, dur, _ in unit_tests)
+        if unit_dur <= ideal_per_group:
+            scope_items[scope] = unit_tests
+        else:
+            # Fall back to individual-test packing for this unit.
+            for item, dur, orig_idx in unit_tests:
+                scope_items[item.nodeid] = [(item, dur, orig_idx)]
+
+
 class ScopeAwareLeastDurationAlgorithm(AlgorithmBase):
     """
     Split tests into groups by runtime, keeping tests from the same scope
-    (module/class) together.
+    together on a *best-effort* basis.
 
-    This algorithm first aggregates tests by their scope (module path for
-    ``--dist=loadscope``), computes the total duration per scope, then uses
-    a greedy bin-packing algorithm (like LeastDurationAlgorithm) to assign
-    *scopes* (not individual tests) to groups.
+    The algorithm aggregates tests into scope units, computes the total
+    duration per scope, then uses a greedy bin-packing algorithm (like
+    LeastDurationAlgorithm) to assign whole *scopes* (not individual tests)
+    to groups. This combines the duration-balancing property of
+    LeastDurationAlgorithm with module-level locality.
 
-    This combines the duration-balancing property of LeastDurationAlgorithm
-    with the locality-preserving property of DurationBasedChunksAlgorithm.
-    When used with ``pytest-xdist --dist=loadscope``, it avoids redundant
-    module imports and fixture setups across workers.
+    Scope units are derived following this hierarchy:
 
-    If a single scope exceeds the ideal time-per-group, it is further
-    subdivided by class (``module::Class``) so that sub-scopes can be
-    distributed across multiple groups.  This handles pathologically
-    large test modules while still preserving locality at the class level.
+    * **module scope** (the file path) is the default unit;
+    * if a module is *oversized* (its estimated duration alone exceeds the
+      ideal per-group duration) and is not a notebook, it is refined into
+      ``loadscope``-like units (``module.py::Class`` for test methods,
+      ``module.py`` for module-level functions -- see :func:`_loadscope_scope`);
+    * if such a unit is *still* oversized on its own, it falls back to
+      individual-test packing.
+
+    Because oversized scopes are refined, locality is best-effort rather than
+    unconditional. The result preserves module-first locality, which is
+    similar in spirit to (but not a drop-in match for) ``pytest-xdist
+    --dist=loadscope`` -- xdist prioritizes class grouping over module
+    grouping, whereas this algorithm keeps whole modules together until they
+    become oversized.
+
+    IPython notebook files (``.ipynb``) are always kept atomic, even when
+    oversized: their cells are order-dependent (see
+    ``pytest_split.ipynb_compatibility``), so they are never refined below
+    file scope.
 
     :param splits: How many groups we're splitting in.
     :param items: Test items passed down by Pytest.
@@ -210,49 +283,23 @@ class ScopeAwareLeastDurationAlgorithm(AlgorithmBase):
         total_duration = sum(dur for _, dur in items_with_durations)
         ideal_per_group = total_duration / splits if splits else total_duration
 
-        # Group items by module scope (everything before the first ::)
+        # Group items by module scope (the file path, before the first ::)
         module_items: dict[str, list[tuple[nodes.Item, float, int]]] = {}
         for orig_idx, (item, dur) in enumerate(items_with_durations):
-            module = item.nodeid.split("::")[0]
-            module_items.setdefault(module, []).append((item, dur, orig_idx))
+            module_items.setdefault(_module_scope(item.nodeid), []).append(
+                (item, dur, orig_idx)
+            )
 
-        # Compute total duration per module
-        module_durations = {
-            module: sum(dur for _, dur, _ in items_list)
-            for module, items_list in module_items.items()
-        }
-
-        # Build scope units: for modules that exceed ideal_per_group,
-        # subdivide by class to allow finer-grained distribution.
-        # If a class-level scope still exceeds ideal, fall back to
-        # individual test packing for that scope.
+        # Build scope units following the locality hierarchy:
+        #   module scope
+        #     -> if oversized and not a notebook: refine to loadscope units
+        #          -> if still oversized: refine to individual tests
+        # Notebooks are always kept atomic at the file level, even when
+        # oversized, because their cells are order-dependent.
         # scope_key -> list of (item, dur, orig_idx)
         scope_items: dict[str, list[tuple[nodes.Item, float, int]]] = {}
-
-        for module, mod_dur in module_durations.items():
-            if mod_dur > ideal_per_group:
-                # Subdivide by class: use "module::Class" or "module::<no-class>"
-                class_items: dict[str, list[tuple[nodes.Item, float, int]]] = {}
-                for item, dur, orig_idx in module_items[module]:
-                    parts = item.nodeid.split("::")
-                    if len(parts) >= 3:
-                        # module::Class::method... -> scope is module::Class
-                        class_key = f"{parts[0]}::{parts[1]}"
-                    else:
-                        # module::function -> scope is module::<no-class>
-                        class_key = f"{parts[0]}::<no-class>"
-                    class_items.setdefault(class_key, []).append((item, dur, orig_idx))
-                # Check if any class scope still exceeds ideal
-                for cls_key, cls_tests in class_items.items():
-                    cls_dur = sum(dur for _, dur, _ in cls_tests)
-                    if cls_dur > ideal_per_group:
-                        # Fall back to individual test packing
-                        for item, dur, orig_idx in cls_tests:
-                            scope_items[item.nodeid] = [(item, dur, orig_idx)]
-                    else:
-                        scope_items[cls_key] = cls_tests
-            else:
-                scope_items[module] = module_items[module]
+        for module, mod_tests in module_items.items():
+            _refine_module_scope(module, mod_tests, ideal_per_group, scope_items)
 
         # Compute total duration per scope unit
         scope_durations = {
@@ -262,7 +309,9 @@ class ScopeAwareLeastDurationAlgorithm(AlgorithmBase):
 
         # Sort scopes by name for determinism, then by duration descending
         sorted_scopes = sorted(scope_durations.keys())
-        sorted_scopes = sorted(sorted_scopes, key=lambda s: scope_durations[s], reverse=True)
+        sorted_scopes = sorted(
+            sorted_scopes, key=lambda s: scope_durations[s], reverse=True
+        )
 
         # Greedy bin-packing of scopes into groups
         scope_to_group: dict[str, int] = {}
